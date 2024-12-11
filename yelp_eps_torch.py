@@ -5,6 +5,7 @@ from data_util import load_data
 import torch
 import torch.optim as optim
 import math
+import argparse
 
 
 # set splitting
@@ -51,14 +52,12 @@ def F1_score(r_pre, rating_matrix, train_matrix, test_index_matrix, num_users, r
         current_test_pred = r_pre[u, test_index]
         rated_item_list = torch.where(current_test_actual >= 4)[0]
         recommendation_list = torch.argsort(current_test_pred, descending=True)[:recommend_number]
-        intersect_item_list = torch.unique(torch.cat((rated_item_list, recommendation_list), 0))
-        current_precision = len(torch.where(torch.isin(intersect_item_list, recommendation_list))[0]) / recommend_number
+        current_precision = len(torch.where(torch.isin(rated_item_list, recommendation_list))[0]) / recommend_number
         try:
-            current_recall = len(torch.where(torch.isin(intersect_item_list, rated_item_list))[0]) / len(rated_item_list)
+            current_recall = len(torch.where(torch.isin(recommendation_list, rated_item_list))[0]) / len(rated_item_list)
         except ZeroDivisionError:
             current_recall = 0
         current_ap = cal_average_precision(rated_item_list, recommendation_list)
-
         precision += current_precision
         recall += current_recall
         mapping += current_ap
@@ -136,7 +135,7 @@ class federated_matrix_factorization_with_projection_p:
         # Read and store icuut variables
         self.__rating_train = train_data.to(device)
         self.__rating_matrix = rating_matrix.to(device)
-        self.__test_index_matrix = test_index_matrix.to(device)
+        self.__test_index_matrix = test_index_matrix # .to(device)
         self.__latent_factor = k
         self.__dim_after_reduction = p
         self.__flattern_dim = p_2
@@ -150,6 +149,7 @@ class federated_matrix_factorization_with_projection_p:
         self.__miu = miu
 
         # matrices
+        S = S.to_sparse()
         self.__S = S.to(device)
         self.__S_T = S.t().to(device)
         self.__H_D = H_D.to(device)
@@ -160,7 +160,8 @@ class federated_matrix_factorization_with_projection_p:
         # User latent matrix, Item latent matrix, projected V
         self.__U = torch.rand(self.__user_size, self.__latent_factor, device = device)
         self.__V = torch.rand(self.__item_size, self.__latent_factor, device = device)
-        self.__B = torch.matmul(self.__S, self.__V).to(device)
+        # self.__B = torch.matmul(self.__S, self.__V).to(device)
+        self.__B = torch.sparse.mm(self.__S, self.__V)
         
         # adam
         self.optimizer = optim.Adam([self.__B], lr=lr_adam, betas=(beta_1, beta_2), eps=epsilon_adam)
@@ -248,7 +249,8 @@ class federated_matrix_factorization_with_projection_p:
 
             for j in range(sample_size):
                 gradient_V_j = torch.outer(MF_error_uncertain[j], sample_U[j]).float().to(self.__device)
-                gradient_B_j = torch.matmul(self.__S, gradient_V_j).to(self.__device)  # projection
+                # gradient_B_j = torch.matmul(self.__S, gradient_V_j).to(self.__device)  # projection
+                gradient_B_j = torch.sparse.mm(self.__S, gradient_V_j)
                 flat_gradient_B_j = self.flatMa(gradient_B_j)  # flatten
 
                 # PBM
@@ -269,8 +271,8 @@ class federated_matrix_factorization_with_projection_p:
             self.optimizer.step()
             
             # update V
-            self.__V = torch.matmul(self.__S_T, self.__B)
-            
+            # self.__V = torch.matmul(self.__S_T, self.__B)
+            self.__V = torch.sparse.mm(self.__S_T, self.__B)
             # memory release
             Z_sum.zero_()
             del sample_U, MF_error_new, MF_error_uncertain, gradient_B
@@ -279,14 +281,16 @@ class federated_matrix_factorization_with_projection_p:
             t1_2 = time.time()
             t  = t + t1_2 - t1_1
 
-            if i == maxitr - 1:
-                # distribute the final matrix to all users for update
-                self.update_U(torch.arange(self.__user_size))
-                print(f'Train and test accurary for epoch: {i+1}')
-                #print(self.loss())
-                self.sample_score()
+            # if i == maxitr - 1:
+            #     # distribute the final matrix to all users for update
+            #     self.update_U(torch.arange(self.__user_size))
+            #     print(f'Train and test accurary for epoch: {i+1}')
+            #     #print(self.loss())
+            #     self.sample_score()
 
             if (i+1)%10 == 0:
+                if i == maxitr - 1:
+                    self.update_U(torch.arange(self.__user_size))
                 print(f'Train and test accurary for epoch: {i+1}')
                 #print(self.loss())
                 print("Average Iteration time:")
@@ -308,15 +312,24 @@ class federated_matrix_factorization_with_projection_p:
         torch.cuda.empty_cache()
 
 # data preprocessing
-class Args:
-    root_path = "/mnt/sda/MF_secagg"
-    dataset = "yelp"
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root_path", type=str, default="/mnt/sda/MF_secagg")
+    parser.add_argument("--dataset", type=str, default="yelp")
+    parser.add_argument("--p_ratio", type=int, default=10)
+    parser.add_argument("--pb_eps", type=float, default=0.01)
+    parser.add_argument("--k", type=int, default=20)
+    parser.add_argument("--sample_pct", type=float, default=0.1)
+    parser.add_argument("--lambda_", type=float, default=0.25)
+    parser.add_argument("--miu", type=float, default=0.9)
+    args = parser.parse_args()
+    return args
 
-args = Args()
+args = get_args()
 item_df, user_df, rating_df = load_data(args)
 rating_df = pd.pivot_table(rating_df,values = ['Rating'],index=['UserID'], columns=['ItemID'],fill_value=0)
 user_size = 10000
-item_size = 93387//4
+item_size = 93387//3 # Memory-Usage: ~20000MB
 rating_matrix = torch.tensor(rating_df.iloc[:user_size,:item_size].values) # .iloc[:5000,:5000]
 print(user_size,item_size)
 item_df, user_df, rating_df = 0, 0, 0
@@ -324,16 +337,16 @@ item_df, user_df, rating_df = 0, 0, 0
 train_val_matrix, test_index_matrix = set_splitter(rating_matrix, user_size, item_size, pct = 0.8)
 
 
-k = 14
+k = args.k
 # privacy budgets
-pb_eps = 0.01
+pb_eps = args.pb_eps
 pb_alpha = 2
-p = item_size//10
+p = item_size//args.p_ratio
 pbm_m, theta = get_theta_m(pb_eps, pb_alpha, 1, user_size, p, k)
 print("Privacy budgets:", pbm_m, theta)
 # uncertain matrix
 alpha_uncertain = 14
-C_uncertain = (train_val_matrix > 0) * alpha_uncertain + 1
+C_uncertain = ((train_val_matrix > 0) * alpha_uncertain + 1).float()
 # random projection matrix
 S = sparseProject(p, item_size, 1)
 p_2 = 2 ** math.ceil(math.log2(p))
@@ -345,9 +358,10 @@ H_D = torch.matmul(H, D)
 mf = federated_matrix_factorization_with_projection_p(
     train_data = train_val_matrix, rating_matrix = rating_matrix, test_index_matrix = test_index_matrix, k = k, p = p, p_2 = p_2,
     e_max = 1.5, e_min = -1, user_size = user_size, item_size = item_size,
-    lambda_ = 0.25, miu = 0.9,
+    lambda_ = args.lambda_, miu = args.miu,
     S = S, H_D = H_D,  alpha_uncertain = alpha_uncertain, C_uncertain = C_uncertain,
-    device=torch.device('cuda:0'),
+    # device=torch.device('cuda:1'),
+    device="cuda",
     beta_1 = 0.9, beta_2 = 0.8, epsilon_adam = 0.01, lr_adam = 0.05)
 
-mf.train(B_1 = 0.001, theta = theta, m_pbm = pbm_m, maxitr = 200, sample_pct = 0.1) # without calculating m_pbm --> m_pbm = 1, without calculating theta --> theta = 0.25
+mf.train(B_1 = 0.001, theta = theta, m_pbm = pbm_m, maxitr = 100, sample_pct = args.sample_pct) # without calculating m_pbm --> m_pbm = 1, without calculating theta --> theta = 0.25
